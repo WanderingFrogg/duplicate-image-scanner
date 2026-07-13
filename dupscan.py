@@ -86,16 +86,16 @@ def pick_folder():
            )
            selected_folder = result.stdout.strip()
            return selected_folder or ""
+       else:
+           import tkinter as tk
+           from tkinter import filedialog
 
-       import tkinter as tk
-       from tkinter import filedialog
-
-       root = tk.Tk()
-       root.withdraw()
-       root.attributes("-topmost", True)
-       folder_selected = filedialog.askdirectory()
-       root.destroy()
-       return folder_selected or ""
+           root = tk.Tk()
+           root.withdraw()
+           root.attributes("-topmost", True)
+           folder_selected = filedialog.askdirectory()
+           root.destroy()
+           return folder_selected or ""
    except Exception:
        return ""
 
@@ -124,22 +124,32 @@ folder_input = st.text_input(
 if st.button("Start Scan", type="primary"):
    if os.path.exists(folder_input):
        with st.spinner("Crunching pixels..."):
-           results = scan_for_duplicates(folder_input)
+           st.session_state.results = scan_for_duplicates(folder_input)
+           st.session_state.scanning_folder = folder_input
 
-       if not results:
-           st.success("Clean folder! No duplicate images detected.")
-       else:
-           st.warning(f"Scan complete. Found {len(results)} duplicate groups.")
-           st.divider()
+   else:
+       st.error("That folder path doesn't seem to exist. Try browsing for it!")
 
-           for group_num, (fingerprint, file_list) in enumerate(
-               results.items(), start=1
-           ):
-               st.subheader(f"Match Group #{group_num}")
-               cols = st.columns(len(file_list))
+# If we have stored results display them and allow deletion in-place
+if "results" in st.session_state and st.session_state.get("results"):
+   results = st.session_state.results
+   if not results:
+       st.success("Clean folder! No duplicate images detected.")
+   else:
+       st.warning(f"Scan complete. Found {len(results)} duplicate groups.")
+       st.divider()
 
-               for col_idx, file_path in enumerate(file_list):
-                   with cols[col_idx]:
+       # iterate over a copy of items so we can mutate session_state.results
+       for group_num, (fingerprint, file_list) in enumerate(list(results.items()), start=1):
+           if not file_list:
+               continue
+           st.subheader(f"Match Group #{group_num}")
+           cols = st.columns(len(file_list))
+
+           for col_idx, file_path in enumerate(list(file_list)):
+               with cols[col_idx]:
+                   # show image if it still exists
+                   if os.path.exists(file_path):
                        st.image(file_path, use_container_width=True)
 
                        file_name = os.path.basename(file_path)
@@ -148,11 +158,17 @@ if st.button("Start Scan", type="primary"):
                        st.caption(f"**{file_name}**")
                        st.text(f"Size: {file_size_kb:.1f} KB")
 
-                       if st.button(
-                           "🗑️ Delete this copy", key=f"del_{file_path}"
-                       ):
-                           os.remove(file_path)
-                           st.rerun()
-               st.divider()
-   else:
-       st.error("That folder path doesn't seem to exist. Try browsing for it!")
+                       if st.button("🗑️ Delete this copy", key=f"del_{file_path}"):
+                           try:
+                               os.remove(file_path)
+                           except Exception:
+                               st.error("Could not delete the file.")
+                           # remove from session results and allow Streamlit to rerun naturally
+                           if fingerprint in st.session_state.results:
+                               if file_path in st.session_state.results[fingerprint]:
+                                   st.session_state.results[fingerprint].remove(file_path)
+                               if len(st.session_state.results[fingerprint]) < 2:
+                                   del st.session_state.results[fingerprint]
+                   else:
+                       st.text("File not found on disk")
+           st.divider()
