@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 from collections import defaultdict
 import imagehash
 from PIL import Image
@@ -71,6 +73,20 @@ def scan_for_duplicates(folder_path):
 # We use 'session_state' to force it to remember the folder path.
 def pick_folder():
    try:
+       if sys.platform == "darwin":
+           result = subprocess.run(
+               [
+                   "osascript",
+                   "-e",
+                   'POSIX path of (choose folder with prompt "Select a folder")',
+               ],
+               capture_output=True,
+               text=True,
+               check=True,
+           )
+           selected_folder = result.stdout.strip()
+           return selected_folder or ""
+
        import tkinter as tk
        from tkinter import filedialog
 
@@ -79,7 +95,7 @@ def pick_folder():
        root.attributes("-topmost", True)
        folder_selected = filedialog.askdirectory()
        root.destroy()
-       return folder_selected
+       return folder_selected or ""
    except Exception:
        return ""
 
@@ -95,9 +111,9 @@ if st.button("Browse Folder"):
    selected_folder = pick_folder()
    if selected_folder:
        st.session_state.folder_path = selected_folder
-       st.experimental_rerun()
+       st.rerun()
    else:
-       st.warning("No folder selected.")
+       st.info("The folder picker could not be opened. Please paste the folder path manually instead.")
 
 # 3. The Input Box (now automatically filled by the Browse button)
 folder_input = st.text_input(
