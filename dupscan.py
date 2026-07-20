@@ -549,7 +549,7 @@ if "results" in st.session_state and st.session_state.get("results"):
 
            action_cols = st.columns([1,1,1,1])
            with action_cols[0]:
-                   if st.button("Restore Selected"):
+               if st.button("Restore Selected"):
                    # restore in reverse order to avoid index shifts
                    for sel in sorted(selected, reverse=True):
                        entry = st.session_state.undo_stack[sel]
