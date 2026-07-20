@@ -383,7 +383,11 @@ if "results" in st.session_state and st.session_state.get("results"):
                        del st.session_state.pending_action
                        st.experimental_rerun()
                with cols[2]:
-                   st.info(f"The file will be moved to the trash folder ({get_trash_dir()}). You can undo recent deletes from the Trash & Undo panel below.")
+                   # Inform user whether system Trash or local trash will be used
+                   if st.session_state.get("use_system_trash") and send2trash is not None:
+                       st.info("The file will be moved to the system Trash/Recycle Bin. Open the Trash & Undo panel to view entries recorded by the app.")
+                   else:
+                       st.info(f"The file will be moved to the trash folder ({get_trash_dir()}). You can undo recent deletes from the Trash & Undo panel below.")
 
            elif act_type == "keep_one":
                keep = action.get("keep")
@@ -428,7 +432,8 @@ if "results" in st.session_state and st.session_state.get("results"):
 
        # System trash support toggle (send2trash if available)
        if "use_system_trash" not in st.session_state:
-           st.session_state.use_system_trash = False
+           # default to system Trash when send2trash is installed
+           st.session_state.use_system_trash = True if send2trash is not None else False
        # Auto-empty settings
        if "auto_empty_days" not in st.session_state:
            st.session_state.auto_empty_days = 30
@@ -438,18 +443,14 @@ if "results" in st.session_state and st.session_state.get("results"):
        st.divider()
        st.subheader("Trash & Undo")
 
-       # System trash toggle
+       # System trash toggle (show current availability)
        st.session_state.use_system_trash = st.checkbox(
            "Move deletes to system Trash/Recycle Bin if available (send2trash)",
            value=st.session_state.use_system_trash,
            key="use_system_trash_input",
        )
        # show availability note
-       try:
-           from send2trash import send2trash  # noqa: F401
-           send2trash_available = True
-       except Exception:
-           send2trash_available = False
+       send2trash_available = send2trash is not None
        if st.session_state.use_system_trash and not send2trash_available:
            st.warning("send2trash not installed — system Trash option is unavailable. Install with 'pip install send2trash' to enable it.")
 
