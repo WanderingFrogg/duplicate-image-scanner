@@ -306,7 +306,7 @@ if "results" in st.session_state and st.session_state.get("results"):
            for col_idx, file_path in enumerate(list(file_list)):
                with cols[col_idx]:
                    if os.path.exists(file_path):
-                       st.image(file_path, use_container_width=True)
+                       st.image(file_path, width='stretch')
 
                        file_name = os.path.basename(file_path)
                        file_size_kb = os.path.getsize(file_path) / 1024
