@@ -9,6 +9,7 @@ import shutil
 import time
 from datetime import datetime
 import json
+import tempfile
 # Optional system trash support
 try:
     from send2trash import send2trash
@@ -162,6 +163,8 @@ def move_to_trash(path, fingerprint=None):
         save_undo_index()
     except Exception:
         pass
+    # record last move result for diagnostics
+    st.session_state.last_move_result = entry
     # Return a sentinel for system-trash to indicate success but no local path
     if entry.get("system"):
         return "__SYSTEM_TRASH__"
@@ -625,8 +628,8 @@ if "results" in st.session_state and st.session_state.get("results"):
        else:
            st.info("Trash is empty")
 
-       # Quick controls
-       qcols = st.columns([1,1])
+       # Quick controls + diagnostic
+       qcols = st.columns([1,1,1])
        with qcols[0]:
            if st.button("Show trash folder"):
                st.info(trash)
@@ -639,6 +642,52 @@ if "results" in st.session_state and st.session_state.get("results"):
                    pass
                st.success("Cleared undo history (trashed files left on disk)")
                st.experimental_rerun()
+       with qcols[2]:
+           if st.button("Run Trash Diagnostic"):
+               # Run quick diagnostics using the same Python interpreter powering Streamlit
+               diag = {}
+               diag["sys_executable"] = sys.executable
+               diag["python_version"] = sys.version
+               diag["send2trash_available"] = True if send2trash is not None else False
+               # Create a temp file (in scanning folder when possible so move behaves similarly)
+               base = st.session_state.get("scanning_folder") if st.session_state.get("scanning_folder") and os.path.exists(st.session_state.get("scanning_folder")) else None
+               try:
+                   if base:
+                       tmp = tempfile.NamedTemporaryFile(delete=False, dir=base, suffix=".diag.txt")
+                   else:
+                       tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".diag.txt")
+                   tmp.write(b"diagnostic")
+                   tmp.close()
+                   diag["tmp_created"] = tmp.name
+               except Exception as e:
+                   diag["tmp_error"] = str(e)
+                   st.session_state.last_diag = diag
+                   st.experimental_rerun()
+
+               # Attempt to move to trash using the app's move_to_trash (respects use_system_trash)
+               try:
+                   res = move_to_trash(tmp.name, fingerprint="diag")
+                   diag["move_to_trash_result"] = res
+               except Exception as e:
+                   diag["move_error"] = str(e)
+
+               # Capture last_move_result as recorded by move_to_trash
+               diag["last_move_result"] = st.session_state.get("last_move_result")
+               st.session_state.last_diag = diag
+               st.experimental_rerun()
+
+       # Show diagnostics result if present
+       if st.session_state.get("last_diag"):
+           diag = st.session_state.get("last_diag")
+           st.markdown("**Trash Diagnostic Result**")
+           st.write(f"Python executable: {diag.get('sys_executable')}")
+           st.write(f"Python version: {diag.get('python_version')}")
+           st.write(f"send2trash available: {diag.get('send2trash_available')}")
+           st.write(f"Temp file created: {diag.get('tmp_created', 'n/a')}")
+           st.write(f"move_to_trash result: {diag.get('move_to_trash_result')}")
+           st.write(f"last_move_result (entry): {diag.get('last_move_result')}")
+           if diag.get('tmp_created'):
+               st.info('A temporary diagnostic file was created and moved to trash (or system Trash). Check your OS Trash or the .duplicate_trash folder.')
 
        # Navigation controls (move by page size)
        st.divider()
