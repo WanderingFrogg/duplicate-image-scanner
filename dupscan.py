@@ -5,6 +5,19 @@ from collections import defaultdict
 import imagehash
 from PIL import Image
 import streamlit as st
+import shutil
+import time
+from datetime import datetime
+import json
+import tempfile
+# Optional system trash support
+try:
+    from send2trash import send2trash
+except Exception:
+    send2trash = None
+# Supported image extensions for previews and detection
+VALID_IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+
 # Set the webpage title and layout
 st.set_page_config(page_title="Duplicate Image Scanner", layout="wide")
 
@@ -65,6 +78,130 @@ def scan_for_duplicates(folder_path):
    }
 
    return duplicates_only
+
+
+# --- Helpers for safe deletes (undo buffer using a trash folder) ---
+
+def get_trash_dir():
+   """Return a trash folder path inside the scanning folder (or home if none)."""
+   base = st.session_state.get("scanning_folder") or os.path.expanduser("~")
+   trash = os.path.join(base, ".duplicate_trash")
+   os.makedirs(trash, exist_ok=True)
+   # Load persistent undo index when the trash folder is available
+   load_undo_index()
+   return trash
+
+
+def undo_index_path():
+   base = st.session_state.get("scanning_folder") or os.path.expanduser("~")
+   trash = os.path.join(base, ".duplicate_trash")
+   return os.path.join(trash, "undo.json")
+
+
+def load_undo_index():
+   p = undo_index_path()
+   if os.path.exists(p):
+       try:
+           with open(p, "r") as f:
+               data = json.load(f)
+           # Ensure it's a list
+           if isinstance(data, list):
+               st.session_state.undo_stack = data
+           else:
+               st.session_state.undo_stack = st.session_state.get("undo_stack", [])
+       except Exception:
+           st.session_state.undo_stack = st.session_state.get("undo_stack", [])
+   else:
+       # leave any existing in-memory stack, or initialize empty
+       st.session_state.undo_stack = st.session_state.get("undo_stack", [])
+
+
+def save_undo_index():
+   p = undo_index_path()
+   try:
+       tmp = p + ".tmp"
+       with open(tmp, "w") as f:
+           json.dump(st.session_state.get("undo_stack", []), f)
+       os.replace(tmp, p)
+   except Exception:
+       # best-effort; don't crash the app on save errors
+       pass
+
+
+def move_to_trash(path, fingerprint=None):
+    """Move a file to the trash (system or local) and record it in the undo stack.
+
+    Returns the trashed path (or None for system trash) on success, None on failure.
+    """
+    if not os.path.exists(path):
+        return None
+    ts = int(time.time() * 1000)
+    # If user opted for system trash and send2trash is available, use it
+    use_system = st.session_state.get("use_system_trash", False) and send2trash is not None
+    if use_system:
+        try:
+            send2trash(path)
+        except Exception:
+            return None
+        # We cannot reliably determine the system trash path; mark trashed as None
+        entry = {"original": path, "trashed": None, "time": ts, "fingerprint": fingerprint, "system": True}
+    else:
+        trash = get_trash_dir()
+        base = os.path.basename(path)
+        dest = os.path.join(trash, f"{ts}_{base}")
+        try:
+            shutil.move(path, dest)
+        except Exception:
+            return None
+        entry = {"original": path, "trashed": dest, "time": ts, "fingerprint": fingerprint}
+
+    if "undo_stack" not in st.session_state:
+        st.session_state.undo_stack = []
+    st.session_state.undo_stack.append(entry)
+    # persist undo index to disk
+    try:
+        save_undo_index()
+    except Exception:
+        pass
+    # record last move result for diagnostics
+    st.session_state.last_move_result = entry
+    # Return a sentinel for system-trash to indicate success but no local path
+    if entry.get("system"):
+        return "__SYSTEM_TRASH__"
+    return entry.get("trashed")
+
+
+def restore_from_trash(entry):
+   """Restore a trashed file back to its original location and update results.
+
+   Returns True on success, False otherwise.
+   """
+   # System-trash entries cannot be restored by this app
+   if entry.get("trashed") is None:
+       return False
+   trashed = entry.get("trashed")
+   original = entry.get("original")
+   fp = entry.get("fingerprint")
+   if not trashed or not os.path.exists(trashed):
+       return False
+   try:
+       dest_dir = os.path.dirname(original)
+       os.makedirs(dest_dir, exist_ok=True)
+       shutil.move(trashed, original)
+   except Exception:
+       return False
+
+   # Re-insert into results under the fingerprint if possible
+   if fp:
+       if "results" not in st.session_state:
+           st.session_state.results = {}
+       if fp in st.session_state.results:
+           if original not in st.session_state.results[fp]:
+               st.session_state.results[fp].append(original)
+       else:
+           # recreate group with just the restored file
+           st.session_state.results[fp] = [original]
+   return True
 
 
 # --- THE DASHBOARD (Webpage UI) ---
@@ -132,25 +269,47 @@ if st.button("Start Scan", type="primary"):
 
 # If we have stored results display them and allow deletion in-place
 if "results" in st.session_state and st.session_state.get("results"):
+   # Keep a stable ordered list of groups so we can navigate between them without re-scanning
+   if "group_index" not in st.session_state:
+       st.session_state.group_index = 0
+
+   if "groups_per_page" not in st.session_state:
+       st.session_state.groups_per_page = 1
+
    results = st.session_state.results
    if not results:
        st.success("Clean folder! No duplicate images detected.")
    else:
-       st.warning(f"Scan complete. Found {len(results)} duplicate groups.")
+       groups = list(results.items())
+       # clamp the index
+       if st.session_state.group_index >= len(groups):
+           st.session_state.group_index = max(0, len(groups) - 1)
+
+       st.warning(f"Scan complete. Found {len(groups)} duplicate groups.")
        st.divider()
 
-       # iterate over a copy of items so we can mutate session_state.results
-       for group_num, (fingerprint, file_list) in enumerate(list(results.items()), start=1):
-           if not file_list:
-               continue
-           st.subheader(f"Match Group #{group_num}")
-           cols = st.columns(len(file_list))
+       # Control: how many groups to show per page
+       max_groups = max(1, len(groups))
+       per_page = st.number_input(
+           "Groups per page:", min_value=1, max_value=max_groups, value=st.session_state.groups_per_page, step=1, key="groups_per_page_input"
+       )
+       st.session_state.groups_per_page = int(per_page)
 
+       # Slice the groups for current page
+       start = st.session_state.group_index
+       end = min(start + st.session_state.groups_per_page, len(groups))
+       page_groups = groups[start:end]
+
+       # Show selected groups
+       for i, (fingerprint, file_list) in enumerate(page_groups, start=start + 1):
+           st.subheader(f"Match Group #{i} of {len(groups)}")
+
+           # Display images for this group
+           cols = st.columns(len(file_list) if file_list else 1)
            for col_idx, file_path in enumerate(list(file_list)):
                with cols[col_idx]:
-                   # show image if it still exists
                    if os.path.exists(file_path):
-                       st.image(file_path, use_container_width=True)
+                       st.image(file_path, width='stretch')
 
                        file_name = os.path.basename(file_path)
                        file_size_kb = os.path.getsize(file_path) / 1024
@@ -158,17 +317,397 @@ if "results" in st.session_state and st.session_state.get("results"):
                        st.caption(f"**{file_name}**")
                        st.text(f"Size: {file_size_kb:.1f} KB")
 
+                       # Instead of immediately deleting, set a pending action so the user must confirm
                        if st.button("🗑️ Delete this copy", key=f"del_{file_path}"):
-                           try:
-                               os.remove(file_path)
-                           except Exception:
-                               st.error("Could not delete the file.")
-                           # remove from session results and allow Streamlit to rerun naturally
-                           if fingerprint in st.session_state.results:
-                               if file_path in st.session_state.results[fingerprint]:
-                                   st.session_state.results[fingerprint].remove(file_path)
-                               if len(st.session_state.results[fingerprint]) < 2:
-                                   del st.session_state.results[fingerprint]
+                           st.session_state.pending_action = {
+                               "type": "delete",
+                               "fingerprint": fingerprint,
+                               "target": file_path,
+                               "continue": False,
+                           }
+                           st.experimental_rerun()
+
+                       if st.button("🗑️ Delete and continue", key=f"delcont_{file_path}"):
+                           st.session_state.pending_action = {
+                               "type": "delete",
+                               "fingerprint": fingerprint,
+                               "target": file_path,
+                               "continue": True,
+                           }
+                           st.experimental_rerun()
+
+                       # Bulk action: keep this file, delete the other copies in the same group
+                       if st.button("🔒 Keep this, delete others", key=f"keepone_{file_path}"):
+                           st.session_state.pending_action = {
+                               "type": "keep_one",
+                               "fingerprint": fingerprint,
+                               "keep": file_path,
+                               "continue": True,
+                           }
+                           st.experimental_rerun()
+
                    else:
                        st.text("File not found on disk")
+
            st.divider()
+
+       # Confirmation area for pending actions (uses trash + undo stack)
+       if st.session_state.get("pending_action"):
+           action = st.session_state.pending_action
+           act_type = action.get("type")
+
+           if act_type == "delete":
+               tgt = action.get("target")
+               fp = action.get("fingerprint")
+               st.warning(f"Confirm deletion of: {tgt}")
+               cols = st.columns([1,1,3])
+               with cols[0]:
+                   if st.button("Confirm Delete"):
+                       dest = move_to_trash(tgt, fp)
+                       if not dest:
+                           st.error("Could not move the file to trash.")
+                       else:
+                           # update results
+                           if fp in st.session_state.results and tgt in st.session_state.results[fp]:
+                               st.session_state.results[fp].remove(tgt)
+                               if len(st.session_state.results[fp]) < 2:
+                                   del st.session_state.results[fp]
+                           # adjust index if needed
+                           if action.get("continue"):
+                               if st.session_state.group_index < len(st.session_state.results) - 1:
+                                   st.session_state.group_index += 1
+                               else:
+                                   st.session_state.group_index = max(0, len(st.session_state.results) - 1)
+                       # clear pending and refresh
+                       del st.session_state.pending_action
+                       st.experimental_rerun()
+               with cols[1]:
+                   if st.button("Cancel"):
+                       del st.session_state.pending_action
+                       st.experimental_rerun()
+               with cols[2]:
+                   # Inform user whether system Trash or local trash will be used
+                   if st.session_state.get("use_system_trash") and send2trash is not None:
+                       st.info("The file will be moved to the system Trash/Recycle Bin. Open the Trash & Undo panel to view entries recorded by the app.")
+                   else:
+                       st.info(f"The file will be moved to the trash folder ({get_trash_dir()}). You can undo recent deletes from the Trash & Undo panel below.")
+
+           elif act_type == "keep_one":
+               keep = action.get("keep")
+               fp = action.get("fingerprint")
+               others = [p for p in st.session_state.results.get(fp, []) if p != keep]
+               st.warning(f"Confirm: delete {len(others)} files and keep {keep}")
+               cols = st.columns([1,1,3])
+               with cols[0]:
+                   if st.button("Confirm Keep One"):
+                       deleted_any = False
+                       for p in others:
+                           dest = move_to_trash(p, fp)
+                           if dest:
+                               deleted_any = True
+                           else:
+                               st.error(f"Could not move {p} to trash")
+                       # update session results
+                       if fp in st.session_state.results:
+                           # keep only the chosen file
+                           st.session_state.results[fp] = [keep]
+                           if len(st.session_state.results[fp]) < 2:
+                               del st.session_state.results[fp]
+                       # move to next group if requested
+                       if action.get("continue"):
+                           if st.session_state.group_index < len(st.session_state.results) - 1:
+                               st.session_state.group_index += 1
+                           else:
+                               st.session_state.group_index = max(0, len(st.session_state.results) - 1)
+                       del st.session_state.pending_action
+                       st.experimental_rerun()
+               with cols[1]:
+                   if st.button("Cancel Keep One"):
+                       del st.session_state.pending_action
+                       st.experimental_rerun()
+               with cols[2]:
+                   st.info(f"All other copies will be moved to the trash folder ({get_trash_dir()}). You can undo if needed.")
+
+       # Trash / Undo panel (selective restore, auto-purge, system trash option)
+       # Ensure undo stack exists
+       if "undo_stack" not in st.session_state:
+           st.session_state.undo_stack = []
+
+       # System trash support toggle (send2trash if available)
+       if "use_system_trash" not in st.session_state:
+           # default to system Trash when send2trash is installed
+           st.session_state.use_system_trash = True if send2trash is not None else False
+       # Auto-empty settings
+       if "auto_empty_days" not in st.session_state:
+           st.session_state.auto_empty_days = 30
+       if "auto_empty_enabled" not in st.session_state:
+           st.session_state.auto_empty_enabled = True
+
+       st.divider()
+       st.subheader("Trash & Undo")
+
+       # System trash toggle (show current availability)
+       st.session_state.use_system_trash = st.checkbox(
+           "Move deletes to system Trash/Recycle Bin if available (send2trash)",
+           value=st.session_state.use_system_trash,
+           key="use_system_trash_input",
+       )
+       # show availability note
+       send2trash_available = send2trash is not None
+       if st.session_state.use_system_trash and not send2trash_available:
+           st.warning("send2trash not installed — system Trash option is unavailable. Install with 'pip install send2trash' to enable it.")
+
+       trash = get_trash_dir()
+       st.write(f"Local trash folder: {trash} (used when system Trash is unavailable or not selected)")
+
+       # Auto-empty controls
+       cols_ae = st.columns([2,1])
+       with cols_ae[0]:
+           st.session_state.auto_empty_enabled = st.checkbox("Auto-purge trashed items older than N days", value=st.session_state.auto_empty_enabled)
+       with cols_ae[1]:
+           st.session_state.auto_empty_days = st.number_input("Days", min_value=1, max_value=3650, value=st.session_state.auto_empty_days, key="auto_empty_days_input")
+
+       # Purge old trashed items if enabled
+       def purge_old_trash(days):
+           now_ms = int(time.time() * 1000)
+           kept = []
+           removed_count = 0
+           for e in list(st.session_state.get("undo_stack", [])):
+               entry_time = e.get("time") or 0
+               age_ms = now_ms - entry_time
+               if age_ms > days * 24 * 60 * 60 * 1000:
+                   # attempt to remove trashed file if present
+                   tpath = e.get("trashed")
+                   try:
+                       if tpath and os.path.exists(tpath):
+                           os.remove(tpath)
+                           removed_count += 1
+                   except Exception:
+                       # couldn't remove, keep the entry so user can inspect
+                       kept.append(e)
+                       continue
+                   # if system entry (trashed is None), just drop the record
+               else:
+                   kept.append(e)
+           st.session_state.undo_stack = kept
+           try:
+               save_undo_index()
+           except Exception:
+               pass
+           return removed_count
+
+       if st.session_state.auto_empty_enabled and st.session_state.auto_empty_days:
+           removed = purge_old_trash(int(st.session_state.auto_empty_days))
+           if removed:
+               st.info(f"Auto-purged {removed} trashed files older than {st.session_state.auto_empty_days} days.")
+
+       # Show undo stack with selectable entries
+       undo_list = st.session_state.get("undo_stack", [])
+       st.write(f"Pending undo items: {len(undo_list)}")
+
+       selected = []
+       if undo_list:
+           st.markdown("Select items to restore or permanently delete:")
+           # Render each undo entry with an optional image preview (if available locally)
+           for idx, entry in enumerate(list(undo_list)):
+               orig = entry.get("original")
+               ts = entry.get("time") or 0
+               ts_readable = datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d %H:%M:%S") if ts else "unknown"
+               system = entry.get("trashed") is None
+               label = f"{orig} — trashed at {ts_readable}" + (" [system Trash]" if system else "")
+
+               # layout: preview | info | select
+               row_cols = st.columns([1, 6, 1])
+               trashed_path = entry.get("trashed")
+               # Preview column
+               with row_cols[0]:
+                   try:
+                       if trashed_path and os.path.exists(trashed_path):
+                           ext = os.path.splitext(trashed_path)[1].lower()
+                           if ext in VALID_IMAGE_EXT:
+                               # show a small preview
+                               try:
+                                   st.image(trashed_path, width=120)
+                               except Exception:
+                                   st.text("Preview unavailable")
+                           else:
+                               st.text("No preview")
+                       else:
+                           st.text("No preview")
+                   except Exception:
+                       st.text("No preview")
+
+               # Info column
+               with row_cols[1]:
+                   st.write(label)
+
+               # Checkbox/select column
+               with row_cols[2]:
+                   key = f"undo_select_{idx}"
+                   if st.checkbox("", key=key):
+                       selected.append(idx)
+
+           action_cols = st.columns([1,1,1,1])
+           with action_cols[0]:
+                   if st.button("Restore Selected"):
+                   # restore in reverse order to avoid index shifts
+                   for sel in sorted(selected, reverse=True):
+                       entry = st.session_state.undo_stack[sel]
+                       if entry.get("trashed") is None:
+                           st.error(f"Cannot restore {entry.get('original')} from system Trash")
+                           continue
+                       ok = restore_from_trash(entry)
+                       if ok:
+                           st.success(f"Restored: {entry.get('original')}")
+                           del st.session_state.undo_stack[sel]
+                       else:
+                           st.error(f"Failed to restore: {entry.get('original')}")
+                   try:
+                       save_undo_index()
+                   except Exception:
+                       pass
+                   st.experimental_rerun()
+           with action_cols[1]:
+               if st.button("Permanently Delete Selected"):
+                   removed_any = 0
+                   for sel in sorted(selected, reverse=True):
+                       entry = st.session_state.undo_stack[sel]
+                       tpath = entry.get("trashed")
+                       if tpath and os.path.exists(tpath):
+                           try:
+                               os.remove(tpath)
+                               removed_any += 1
+                           except Exception:
+                               st.error(f"Could not permanently remove {tpath}")
+                       else:
+                           # system trash entries cannot be removed here
+                           if entry.get("trashed") is None:
+                               st.info(f"{entry.get('original')} was sent to system Trash; cannot permanently remove from here.")
+                       del st.session_state.undo_stack[sel]
+                   try:
+                       save_undo_index()
+                   except Exception:
+                       pass
+                   st.success(f"Removed {removed_any} trashed files permanently and cleared their undo entries")
+                   st.experimental_rerun()
+           with action_cols[2]:
+               if st.button("Undo last delete"):
+                   entry = st.session_state.undo_stack.pop()
+                   try:
+                       save_undo_index()
+                   except Exception:
+                       pass
+                   if entry.get("trashed") is None:
+                       st.error("Cannot restore items sent to system Trash")
+                   else:
+                       ok = restore_from_trash(entry)
+                       if ok:
+                           st.success(f"Restored: {entry.get('original')}")
+                       else:
+                           st.error("Could not restore the file from trash")
+                   st.experimental_rerun()
+           with action_cols[3]:
+               if st.button("Empty Trash (permanent)"):
+                   removed = 0
+                   for e in list(st.session_state.get("undo_stack", [])):
+                       tpath = e.get("trashed")
+                       try:
+                           if tpath and os.path.exists(tpath):
+                               os.remove(tpath)
+                               removed += 1
+                       except Exception:
+                           st.error(f"Could not remove {tpath}")
+                   st.session_state.undo_stack = []
+                   try:
+                       save_undo_index()
+                   except Exception:
+                       pass
+                   st.success(f"Emptied trash ({removed} files removed)")
+                   st.experimental_rerun()
+
+       else:
+           st.info("Trash is empty")
+
+       # Quick controls + diagnostic
+       qcols = st.columns([1,1,1])
+       with qcols[0]:
+           if st.button("Show trash folder"):
+               st.info(trash)
+       with qcols[1]:
+           if st.button("Clear Undo History (leave trashed files)"):
+               st.session_state.undo_stack = []
+               try:
+                   save_undo_index()
+               except Exception:
+                   pass
+               st.success("Cleared undo history (trashed files left on disk)")
+               st.experimental_rerun()
+       with qcols[2]:
+           if st.button("Run Trash Diagnostic"):
+               # Run quick diagnostics using the same Python interpreter powering Streamlit
+               diag = {}
+               diag["sys_executable"] = sys.executable
+               diag["python_version"] = sys.version
+               diag["send2trash_available"] = True if send2trash is not None else False
+               # Create a temp file (in scanning folder when possible so move behaves similarly)
+               base = st.session_state.get("scanning_folder") if st.session_state.get("scanning_folder") and os.path.exists(st.session_state.get("scanning_folder")) else None
+               try:
+                   if base:
+                       tmp = tempfile.NamedTemporaryFile(delete=False, dir=base, suffix=".diag.txt")
+                   else:
+                       tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".diag.txt")
+                   tmp.write(b"diagnostic")
+                   tmp.close()
+                   diag["tmp_created"] = tmp.name
+               except Exception as e:
+                   diag["tmp_error"] = str(e)
+                   st.session_state.last_diag = diag
+                   st.experimental_rerun()
+
+               # Attempt to move to trash using the app's move_to_trash (respects use_system_trash)
+               try:
+                   res = move_to_trash(tmp.name, fingerprint="diag")
+                   diag["move_to_trash_result"] = res
+               except Exception as e:
+                   diag["move_error"] = str(e)
+
+               # Capture last_move_result as recorded by move_to_trash
+               diag["last_move_result"] = st.session_state.get("last_move_result")
+               st.session_state.last_diag = diag
+               st.experimental_rerun()
+
+       # Show diagnostics result if present
+       if st.session_state.get("last_diag"):
+           diag = st.session_state.get("last_diag")
+           st.markdown("**Trash Diagnostic Result**")
+           st.write(f"Python executable: {diag.get('sys_executable')}")
+           st.write(f"Python version: {diag.get('python_version')}")
+           st.write(f"send2trash available: {diag.get('send2trash_available')}")
+           st.write(f"Temp file created: {diag.get('tmp_created', 'n/a')}")
+           st.write(f"move_to_trash result: {diag.get('move_to_trash_result')}")
+           st.write(f"last_move_result (entry): {diag.get('last_move_result')}")
+           if diag.get('tmp_created'):
+               st.info('A temporary diagnostic file was created and moved to trash (or system Trash). Check your OS Trash or the .duplicate_trash folder.')
+
+       # Navigation controls (move by page size)
+       st.divider()
+       nav_step = max(1, st.session_state.groups_per_page)
+       nav_cols = st.columns([1,1,2])
+       with nav_cols[0]:
+           if st.button("⬅️ Previous"):
+               st.session_state.group_index = max(0, st.session_state.group_index - nav_step)
+               st.experimental_rerun()
+       with nav_cols[1]:
+           if st.button("Next ➡️"):
+               st.session_state.group_index = min(max(0, len(groups) - 1), st.session_state.group_index + nav_step)
+               st.experimental_rerun()
+       with nav_cols[2]:
+           if st.button("Rescan Folder"):
+               # Re-run a fresh scan of the stored folder
+               if st.session_state.get("scanning_folder") and os.path.exists(st.session_state.scanning_folder):
+                   with st.spinner("Re-scanning folder..."):
+                       st.session_state.results = scan_for_duplicates(st.session_state.scanning_folder)
+                       st.session_state.group_index = 0
+                       st.experimental_rerun()
+               else:
+                   st.error("No folder stored to re-scan. Please run a new scan.")
